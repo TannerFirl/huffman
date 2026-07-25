@@ -832,28 +832,48 @@ static huffman_node* read_code_table_from_memory(const unsigned char* bufin,
 
 static int do_file_encode(FILE* in, FILE* out, SymbolEncoder* se)
 {
+	/* Read and write in large chunks instead of one fgetc()/fputc() call
+	 * per byte. At -O0 those per-byte stdio calls (and the per-bit
+	 * get_bit() call below) dominate runtime on large files; buffering
+	 * amortizes the call overhead without changing the produced bytes. */
+	enum { CHUNK_SIZE = 65536 };
+	unsigned char inbuf[CHUNK_SIZE];
+	unsigned char outbuf[CHUNK_SIZE];
+	size_t outpos = 0;
 	unsigned char curbyte = 0;
 	unsigned char curbit = 0;
-	int c;
+	size_t nread;
 
-	while ((c = fgetc(in)) != EOF)
+	while ((nread = fread(inbuf, 1, sizeof(inbuf), in)) > 0)
 	{
-		unsigned char uc = (unsigned char)c;
-		huffman_code* code = (*se)[uc];
-		unsigned long i;
+		size_t idx;
 
-		for (i = 0; i < code->numbits; ++i)
+		for (idx = 0; idx < nread; ++idx)
 		{
-			/* Add the current bit to curbyte. */
-			curbyte |= get_bit(code->bits, i) << curbit;
+			huffman_code* code = (*se)[inbuf[idx]];
+			unsigned char* bits = code->bits;
+			unsigned long numbits = code->numbits;
+			unsigned long i;
 
-			/* If this byte is filled up then write it
-			 * out and reset the curbit and curbyte. */
-			if (++curbit == 8)
+			for (i = 0; i < numbits; ++i)
 			{
-				fputc(curbyte, out);
-				curbyte = 0;
-				curbit = 0;
+				/* Inlined equivalent of get_bit(bits, i); avoids a
+				 * function call for every bit of every symbol. */
+				curbyte |= (unsigned char)(((bits[i >> 3] >> (i & 7)) & 1) << curbit);
+
+				/* If this byte is filled up then buffer it for output
+				 * and reset the curbit and curbyte. */
+				if (++curbit == 8)
+				{
+					outbuf[outpos++] = curbyte;
+					if (outpos == sizeof(outbuf))
+					{
+						fwrite(outbuf, 1, outpos, out);
+						outpos = 0;
+					}
+					curbyte = 0;
+					curbit = 0;
+				}
 			}
 		}
 	}
@@ -865,7 +885,10 @@ static int do_file_encode(FILE* in, FILE* out, SymbolEncoder* se)
 	 * then output it.
 	 */
 	if (curbit > 0)
-		fputc(curbyte, out);
+		outbuf[outpos++] = curbyte;
+
+	if (outpos > 0)
+		fwrite(outbuf, 1, outpos, out);
 
 	return 0;
 }
